@@ -826,15 +826,16 @@ MOCK_AI_B = [
 ]
 
 
-def play(solo: bool) -> None:
+def play(solo: bool, script: Optional[Script] = None) -> None:
     """
     双向盲写对局。
     每一轮：双方各提交一次（互相看不见）→ 一起翻开。
     """
+    script = script or SCRIPT_ROAD
     narrator = make_narrator()
     enc = Encounter(
         enc_id=f"enc-{os.urandom(3).hex()}",
-        script=SCRIPT_ROAD,
+        script=script,
         seed=os.urandom(32),
     )
     if solo:
@@ -1588,7 +1589,7 @@ def main() -> int:
     if args.selftest:
         return selftest()
     if args.play or args.solo:
-        play(args.solo)
+        play(args.solo, SCRIPTS.get(args.script, SCRIPT_ROAD))
         return 0
     ap.print_help()
     return 0
