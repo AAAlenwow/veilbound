@@ -2,9 +2,9 @@
 
 项目在 **M0** 阶段——最小、最松的时候。没有贡献流程的官僚主义，也没有稳定的 API。
 
-> **本仓库当前为私有，邀请制协作。**
-> 你可以自由查看、修改、提议；但在项目决定公开之前，请不要把核心机制（匿名对位、三通道、内心即赌注、揭面）的设计细节带到公开场合讨论。
-> 原因很实际：玩法机制本身不受版权保护（[参考](https://dev.americanbar.org/groups/intellectual_property_law/resources/landslide/archive/why-videogame-rules-are-not-expression-protected-copyright-law/)），一旦扩散就很难说清出处。归属记录见 [AUTHORS.md](AUTHORS.md)。
+> 仓库已开源。玩法机制本身不受版权保护（[参考](https://dev.americanbar.org/groups/intellectual_property_law/resources/landslide/archive/why-videogame-rules-are-not-expression-protected-copyright-law/)），
+> 所以设计归属不靠保密，靠 [AUTHORS.md](AUTHORS.md) 里的公开记录——谁在什么时候提出了什么。
+> 引用这些机制时请注明出处。
 
 ## 先跑起来
 
