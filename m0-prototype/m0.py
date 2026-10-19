@@ -124,11 +124,19 @@ class Encounter:
     realness: dict[str, str] = field(default_factory=lambda: {"A": "human", "B": "human"})
     history_note: list[str] = field(default_factory=list)
     outcome: Optional[str] = None
+    # 双向盲写：已提交、尚未结算的行动。两边都到齐才一起揭示。
+    staged: dict[str, dict] = field(default_factory=dict)
+    # 撞车记录：同一轮双方做了同一类动作（同时拔刀 / 同时示弱）
+    collisions: list[dict] = field(default_factory=list)
 
     # -- 当前该谁行动 ---------------------------------------------------
     @property
-    def pending(self) -> str:
-        return "A" if self.state == "PENDING_A" else "B"
+    def pending(self) -> Optional[str]:
+        """双向盲写下：下一个还没提交的一方。两边都提交了返回 None。"""
+        for s in ("A", "B"):
+            if s not in self.staged:
+                return s
+        return None
 
     def other(self, side: str) -> str:
         return "B" if side == "A" else "A"
@@ -525,12 +533,11 @@ def make_narrator() -> Narrator:
 # 6. 一回合驱动
 # ---------------------------------------------------------------------------
 
-def submit(enc: Encounter, actor: str, action_type: str, text: str,
-           intent_text: str, narrator: Narrator,
-           forced_verdict: Optional[dict] = None) -> dict:
+def apply_action(enc: Encounter, actor: str, action_type: str, text: str,
+                 intent_text: str, forced_verdict: Optional[dict] = None) -> dict:
     """
-    提交一次表演（含可选 intent），推进回合。
-    forced_verdict 用于测试/回放/AI 兜底时注入确定判定，正式对局不要传。
+    只做这一方的判定与状态变更，**不推进回合**。
+    双向盲写要靠它把两边各算一次，再统一揭示。
     """
     perf = Performance(turn=enc.turn, actor=actor, action_type=action_type, text=text)
 
@@ -542,17 +549,87 @@ def submit(enc: Encounter, actor: str, action_type: str, text: str,
     enc.performances.append(perf)
     apply_effects(enc, actor, action_type, verdict)
 
+    return {"verdict": verdict, "perf": perf}
+
+
+def submit(enc: Encounter, actor: str, action_type: str, text: str,
+           intent_text: str, narrator: Narrator,
+           forced_verdict: Optional[dict] = None) -> dict:
+    """
+    单边提交 + 推进回合（旧接口，测试与回放用）。
+    正式对局走 stage / resolve_round 的双向盲写流程。
+    forced_verdict 用于测试注入确定判定，正式对局不要传。
+    """
+    r = apply_action(enc, actor, action_type, text, intent_text, forced_verdict)
+
     # 渲染「对面」看到的东西
     opp = enc.other(actor)
-    narrative = narrator.render(enc, opp, action_type, verdict, text)
+    narrative = narrator.render(enc, opp, action_type, r["verdict"], text)
 
     # 状态推进
     if enc.outcome is None and enc.turn >= enc.script.max_turns:
         enc.outcome = "timeout"
     enc.turn += 1
-    enc.state = "RESOLVED" if enc.outcome else ("PENDING_B" if enc.state == "PENDING_A" else "PENDING_A")
+    enc.state = "RESOLVED" if enc.outcome else "AWAITING"
 
-    return {"verdict": verdict, "narrative": narrative, "note": f"已切换到 {enc.pending}"}
+    return {"verdict": r["verdict"], "narrative": narrative,
+            "note": f"已推进到第 {enc.turn} 回合"}
+
+
+# ---- 双向盲写 ------------------------------------------------------------
+
+def stage(enc: Encounter, side: str, action_type: str, text: str,
+          intent: str = "") -> dict:
+    """
+    暂存一方的行动。**不结算、不揭示**。
+    双方都提交后才一起翻开 —— 交出去的那一刻就收不回来了。
+    """
+    if enc.outcome:
+        return {"ok": False, "error": "本局已结束"}
+    if action_type not in ACTION_LABELS:
+        return {"ok": False, "error": f"动作类型必须是 {list(ACTION_LABELS)}"}
+    if side in enc.staged:
+        return {"ok": False, "error": f"{side} 本轮已经提交过了"}
+    enc.staged[side] = {"type": action_type, "text": text or "（沉默不语）",
+                        "intent": intent}
+    return {"ok": True, "staged": side, "waitingFor": enc.pending}
+
+
+def both_staged(enc: Encounter) -> bool:
+    return "A" in enc.staged and "B" in enc.staged
+
+
+def resolve_round(enc: Encounter) -> dict:
+    """
+    双方都提交后，一起结算这一轮。
+    判定顺序固定 A→B，保证可复现。
+    返回每方各自能看到的东西（互不包含对方的判定）。
+    """
+    if not both_staged(enc):
+        return {"ok": False, "error": f"还差一方未提交：{enc.pending}"}
+
+    order = ("A", "B")
+    results = {}
+    for side in order:
+        st = enc.staged[side]
+        results[side] = apply_action(enc, side, st["type"], st["text"], st["intent"])
+
+    # 撞车检测：同一轮双方做了同一类动作
+    if results["A"]["perf"].action_type == results["B"]["perf"].action_type:
+        enc.collisions.append({
+            "turn": enc.turn,
+            "action_type": results["A"]["perf"].action_type,
+        })
+
+    enc.staged.clear()
+    if enc.outcome is None and enc.turn >= enc.script.max_turns:
+        enc.outcome = "timeout"
+    enc.turn += 1
+    enc.state = "RESOLVED" if enc.outcome else "AWAITING"
+
+    return {"ok": True, "results": results,
+            "collision": bool(enc.collisions and enc.collisions[-1]["turn"] == enc.turn - 1),
+            "turn": enc.turn, "outcome": enc.outcome}
 
 
 def render_verdict(verdict: dict) -> str:
@@ -674,23 +751,27 @@ MOCK_AI_B = [
 
 
 def play(solo: bool) -> None:
+    """
+    双向盲写对局。
+    每一轮：双方各提交一次（互相看不见）→ 一起翻开。
+    """
     narrator = make_narrator()
     enc = Encounter(
         enc_id=f"enc-{os.urandom(3).hex()}",
         script=SCRIPT_ROAD,
         seed=os.urandom(32),
     )
-    ai_side = "B" if solo else None
     if solo:
         enc.realness["B"] = "ai_fallback"
     ai_idx = 0
-    pending_narrative: Optional[str] = None
+    last: dict[str, Optional[str]] = {"A": None, "B": None}
 
     clear()
-    header(f"{enc.script.title}")
+    header(enc.script.title)
     print()
     para("这是一次「匿名对位」——你和另一个人被困在同一个场景里。")
     para("你们看到的东西不一样，谁也不知道对面是谁，甚至不知道对面是不是真人。")
+    para("每一轮你们同时行动：交出去之后，就收不回来了。")
     if solo:
         para("你的对手由 AI 扮演。")
     else:
@@ -698,39 +779,74 @@ def play(solo: bool) -> None:
     input("\n  按 Enter 开始……")
 
     while not enc.outcome and enc.turn <= enc.script.max_turns:
-        side = enc.pending
-
-        # ---- AI 回合：不渲染界面，直接行动，产出「给人类看」的叙事 ----
-        if solo and side == ai_side:
-            at, txt, it = MOCK_AI_B[min(ai_idx, len(MOCK_AI_B) - 1)]
-            ai_idx += 1
-            res = submit(enc, side, at, txt, it, narrator)
-            pending_narrative = res["narrative"]
+        # ---------- A 方提交 ----------
+        clear()
+        render_screen(enc, "A", last["A"])
+        last["A"] = None
+        at, txt, it = player_input("A", enc)
+        r = stage(enc, "A", at, txt, it)
+        if not r["ok"]:
             continue
 
-        # ---- 人类回合 ----
-        clear()
-        render_screen(enc, side, pending_narrative)
-        pending_narrative = None
-        at, txt, it = player_input(side, enc)
+        # ---------- B 方提交 ----------
+        if solo:
+            at2, txt2, it2 = MOCK_AI_B[min(ai_idx, len(MOCK_AI_B) - 1)]
+            ai_idx += 1
+            stage(enc, "B", at2, txt2, it2)
+        else:
+            clear()
+            print("\n" * 6)
+            header("请把屏幕交给 B")
+            print("\n  A 已经写好了。按 Enter 交给对方……")
+            input()
+            clear()
+            render_screen(enc, "B", last["B"])
+            last["B"] = None
+            at2, txt2, it2 = player_input("B", enc)
+            r2 = stage(enc, "B", at2, txt2, it2)
+            if not r2["ok"]:
+                continue
 
-        res = submit(enc, side, at, txt, it, narrator)
+        # ---------- 一起翻开 ----------
+        res = resolve_round(enc)
+        if not res["ok"]:
+            continue
+        pa = res["results"]["A"]["perf"]
+        pb = res["results"]["B"]["perf"]
 
-        # 判定明账只给行动方自己看
-        clear()
-        header("这一手的结果" + ("（只有你自己看得到）" if not solo else ""))
-        print(f"\n  {render_verdict(res['verdict'])}")
+        def reveal(side: str, mine, theirs, handoff: str) -> None:
+            clear()
+            header(f"第 {res['turn'] - 1} 轮翻开" + ("  · 撞车" if res["collision"] else ""))
+            print()
+            section("你做了什么")
+            para(f"「{mine.text}」", "·")
+            print()
+            section("他做了什么")
+            para(f"「{theirs.text}」", "·")
+            print()
+            print("─" * W)
+            print(" " + render_verdict(mine.judged))
+            print("─" * W)
+            if res["collision"]:
+                print()
+                para("（你们俩这一轮做了同一类的事。）")
+            if handoff:
+                input(f"\n  {handoff}")
+
+        reveal("A", pa, pb, "" if solo else "请把屏幕交给 B，按 Enter……")
         if not solo:
-            input("\n  请把屏幕交给对方，按 Enter 继续……")
-        pending_narrative = res["narrative"]
+            reveal("B", pb, pa, "请把屏幕交回 A，按 Enter……")
+
+        last["A"] = pb.text
+        last["B"] = pa.text
 
     # ---- 结算 + 揭面 ----
     clear()
     header("遭遇结束")
     print()
     para(f"结果：{enc.outcome or '时间耗尽'}")
-    print(f"  你的气势 {'+' if enc.leverage.get('A', 0) >= 0 else ''}{enc.leverage.get('A', 0)}"
-          f"     判定记录 {len(enc.performances)} 次")
+    print(f"  判定记录 {len(enc.performances)} 次"
+          f"     撞车 {len(enc.collisions)} 次")
     print()
     print("─" * W)
     print(" 揭面（可选）—— 这是本作唯一的社交展示位")
@@ -985,7 +1101,7 @@ def selftest() -> int:
             break
         side = enc.pending
         submit(enc, side, "observe", f"第{i}次", "", narrator)
-        if enc.state not in ("PENDING_A", "PENDING_B", "RESOLVED"):
+        if enc.state not in ("AWAITING", "PENDING_A", "PENDING_B", "RESOLVED"):
             print(f"  [FAIL] 非法状态 {enc.state}")
             ok = False
             break
@@ -993,6 +1109,89 @@ def selftest() -> int:
     print(f"  判定记录 {len(enc.performances)} 条")
     print("  [OK] 状态机未卡死" if ok else "  [FAIL] 状态机异常")
     return 0 if ok else 1
+
+
+def blind_test() -> int:
+    """
+    双向盲写测试。
+    验证：提交即锁定、双方都到齐才揭示、判定可复现、撞车能被识别。
+    """
+    print("=" * 64)
+    print("  双向盲写（Simultaneous Blind Write）")
+    print("=" * 64)
+    failures = []
+
+    # --- 1. 单方提交后不揭示 ---
+    enc = Encounter(enc_id="blind-1", script=SCRIPT_ROAD, seed=b"\x0b" * 32)
+    r1 = stage(enc, "A", "threaten", "我握住了刀柄。")
+    if not r1["ok"]:
+        failures.append(f"stage A 失败：{r1}")
+    if both_staged(enc):
+        failures.append("只提交一方就判定双方到齐")
+    if enc.performances:
+        failures.append("单方提交后就已经结算（应暂存）")
+    if r1.get("waitingFor") != "B":
+        failures.append(f"waitingFor 应为 B，实得 {r1.get('waitingFor')}")
+
+    # --- 2. 同一方重复提交应被拒 ---
+    r2 = stage(enc, "A", "persuade", "我又说了一句。")
+    if r2["ok"]:
+        failures.append("同一方重复提交未被拒绝")
+
+    # --- 3. 双方到齐后一起结算 ---
+    stage(enc, "B", "threaten", "我不退。")
+    if not both_staged(enc):
+        failures.append("双方都提交后未判定为到齐")
+    res = resolve_round(enc)
+    if not res["ok"]:
+        failures.append(f"resolve_round 失败：{res}")
+    if len(enc.performances) != 2:
+        failures.append(f"结算后应有 2 条表演记录，实得 {len(enc.performances)}")
+    if res.get("collision") is not True:
+        failures.append("双方都用了 threaten，撞车未被识别")
+    if enc.staged:
+        failures.append("结算后暂存未清空")
+
+    # --- 4. 双方各自只拿到自己的判定 ---
+    if "results" not in res or set(res["results"]) != {"A", "B"}:
+        failures.append("结算结果未按方返回")
+    else:
+        for side in ("A", "B"):
+            v = res["results"][side]["verdict"]
+            if set(v) != {"roll", "dc", "modifier", "modifier_source", "total", "success"}:
+                failures.append(f"{side} 的判定结构异常 {set(v)}")
+
+    # --- 5. 同样的提交顺序得到同样的结果（可复现）---
+    e1 = Encounter(enc_id="blind-r", script=SCRIPT_ROAD, seed=b"\x0c" * 32)
+    stage(e1, "A", "persuade", "x"); stage(e1, "B", "observe", "y")
+    r_a = resolve_round(e1)["results"]["A"]["verdict"]["roll"]
+
+    e2 = Encounter(enc_id="blind-r", script=SCRIPT_ROAD, seed=b"\x0c" * 32)
+    stage(e2, "A", "persuade", "x"); stage(e2, "B", "observe", "y")
+    r_b = resolve_round(e2)["results"]["A"]["verdict"]["roll"]
+    if r_a != r_b:
+        failures.append("相同 seed 与提交得到不同骰值（不可复现）")
+
+    # --- 6. 回合只推进一次，不是两次 ---
+    e3 = Encounter(enc_id="blind-t", script=SCRIPT_ROAD, seed=b"\x0d" * 32)
+    stage(e3, "A", "help", "x"); stage(e3, "B", "help", "y")
+    resolve_round(e3)
+    if e3.turn != 2:
+        failures.append(f"一轮双向应只推进 1 回合，实得 turn={e3.turn}")
+
+    print()
+    if failures:
+        for f in failures:
+            print(f"  [FAIL] {f}")
+        return 1
+    print("  全部通过：")
+    print("    · 单方提交只暂存，不结算不揭示")
+    print("    · 同一方不能重复提交")
+    print("    · 双方到齐才一起翻开，撞车可识别")
+    print("    · 每方只拿到自己的判定，互不含对方")
+    print("    · 相同 seed + 相同提交 → 相同结果（可复现）")
+    print("    · 一轮只推进 1 个回合")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1230,8 @@ def enc_to_dict(enc: Encounter) -> dict:
         "intents": [
             {"turn": i.turn, "actor": i.actor, "text": i.text} for i in enc.intents
         ],
+        "staged": enc.staged,
+        "collisions": enc.collisions,
     }
 
 
@@ -1049,7 +1250,17 @@ def enc_from_dict(d: dict) -> Encounter:
     enc.disclosed = d.get("disclosed", {"A": [], "B": []})
     enc.performances = [Performance(**p) for p in d.get("performances", [])]
     enc.intents = [Intent(**i) for i in d.get("intents", [])]
+    enc.staged = d.get("staged", {})
+    enc.collisions = d.get("collisions", [])
     return enc
+
+
+def _last_verdict_text(enc: Encounter, side: str) -> Optional[str]:
+    """该方最近一次已结算行动的判定明账。只含自己的。"""
+    mine = [p for p in enc.performances if p.actor == side and p.judged]
+    if not mine:
+        return None
+    return render_verdict(mine[-1].judged)
 
 
 def agent_view(enc: Encounter, side: str) -> dict:
@@ -1073,6 +1284,8 @@ def agent_view(enc: Encounter, side: str) -> dict:
         "yourIntents": [i["text"] for i in selfv["your_intents"]],
         "yourLeverage": selfv["your_leverage"],
         "pending": enc.pending,
+        "waitingFor": enc.pending,
+        "yourLastVerdict": _last_verdict_text(enc, side),
         "finished": bool(enc.outcome),
         "outcome": enc.outcome,
         "dc": enc.script.dc,
@@ -1109,6 +1322,37 @@ def agent_cmd(cmd: str, state_path: str, side: str, action_type: Optional[str],
     if cmd == "status":
         print(json.dumps({"ok": True, "cmd": "status", "state": enc_to_dict(enc)},
                          ensure_ascii=False, indent=1))
+        return 0
+
+    if cmd == "stage":
+        r = stage(enc, side, action_type or "", text or "", intent)
+        if not r.get("ok"):
+            print(json.dumps(r, ensure_ascii=False))
+            return 1
+        json.dump(enc_to_dict(enc), open(state_path, "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=1)
+        print(json.dumps({
+            "ok": True, "cmd": "stage", "staged": side,
+            "waitingFor": r["waitingFor"],
+            "note": ("双方都已提交，可以 commit 揭示" if r["waitingFor"] is None
+                     else f"等待 {r['waitingFor']} 提交"),
+        }, ensure_ascii=False, indent=1))
+        return 0
+
+    if cmd == "commit":
+        r = resolve_round(enc)
+        if not r.get("ok"):
+            print(json.dumps(r, ensure_ascii=False))
+            return 1
+        json.dump(enc_to_dict(enc), open(state_path, "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=1)
+        print(json.dumps({
+            "ok": True, "cmd": "commit",
+            "turn": r["turn"], "outcome": r["outcome"],
+            "collision": r["collision"],
+            "note": ("双方这一轮做了同一类动作，会撞车" if r["collision"] else None),
+            "nextView": agent_view(enc, side),
+        }, ensure_ascii=False, indent=1))
         return 0
 
     if cmd == "act":
@@ -1157,10 +1401,11 @@ def main() -> int:
     ap.add_argument("--solo", action="store_true", help="单人，B 由 mock 回应")
     ap.add_argument("--redteam", action="store_true", help="三通道隔离红队测试")
     ap.add_argument("--matrix", action="store_true", help="intent 联动机制矩阵测试")
+    ap.add_argument("--blindtest", action="store_true", help="双向盲写测试")
     ap.add_argument("--guardtest", action="store_true", help="输出质量闸门测试")
     ap.add_argument("--selftest", action="store_true", help="状态机与判定自检")
     ap.add_argument("--agent", metavar="CMD",
-                    help="agent 模式：start | view | act | status（输出 JSON）")
+                    help="agent 模式：start | stage | commit | view | act | status（输出 JSON）")
     ap.add_argument("--state", default=".enc_state.json", help="agent 模式状态文件")
     ap.add_argument("--side", default="A", help="人类玩家是哪一方（A/B）")
     ap.add_argument("--type", dest="action_type", help="动作类型")
@@ -1177,6 +1422,8 @@ def main() -> int:
         return redteam()
     if args.matrix:
         return matrix_test()
+    if args.blindtest:
+        return blind_test()
     if args.guardtest:
         return guard_test()
     if args.selftest:
