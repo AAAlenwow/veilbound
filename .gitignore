@@ -26,3 +26,8 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# 生成物：音轨、临时预览
+*.wav
+pv-*.png
+f*.jpg
