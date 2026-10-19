@@ -32,6 +32,7 @@ M0 原型 · AI 无限流游戏最小可玩切片
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import json
@@ -161,27 +162,36 @@ class Encounter:
 # ---------------------------------------------------------------------------
 
 class Channels:
+    """
+    三通道隔离。所有跨视角内容必须经过这里。
+
+    ★ 两条硬边界（实测踩过）：
+      1. 函数签名里没有 Intent —— 靠类型系统防守，不靠提示词。
+      2. 对方的 action_type / judged **一律不下发**。
+         玩家该从「他说了什么」里自己推断他在威胁还是在示弱，
+         告诉他「对方（威胁/施压）」等于直接公布答案。
+    """
+
     @staticmethod
     def build_opponent_view(enc: Encounter, viewer: str, up_to_turn: int) -> dict:
         """
-        viewer 看到的、关于「对面」的一切。
-        注意参数：只有 performances 和 enc.disclosed，没有任何 intents 入参。
+        viewer 能感知到的、关于「对面」的一切。
+
+        只给表演的**文本**。不给动作类型，不给判定结果，不给对方的任何数值。
         """
         opp = enc.other(viewer)
         visible_perf = [
-            {"turn": p.turn, "action_type": p.action_type, "text": p.text,
-             "judged": p.judged}
+            {"turn": p.turn, "text": p.text}
             for p in enc.performances
             if p.actor == opp and p.turn <= up_to_turn
         ]
-        # 只给「已授权泄露」的摘要，且断言不含原始标记
-        clues = list(enc.disclosed.get(viewer, []))
         return {
             "role": getattr(enc.script, f"role_{opp.lower()}"),
             "premise": getattr(enc.script, f"premise_{viewer.lower()}"),
             "their_performances": visible_perf,
-            "your_clues": clues,
-            "leverage": enc.leverage,
+            "your_clues": list(enc.disclosed.get(viewer, [])),
+            # 只给 viewer 自己的气势，对方的不露
+            "your_leverage": enc.leverage.get(viewer, 0),
         }
 
     @staticmethod
@@ -201,7 +211,8 @@ class Channels:
                 {"turn": i.turn, "text": i.text}
                 for i in enc.intents_of(viewer) if i.turn <= up_to_turn
             ],
-            "leverage": enc.leverage,
+            "your_clues": list(enc.disclosed.get(viewer, [])),
+            "your_leverage": enc.leverage.get(viewer, 0),
         }
 
 
@@ -340,7 +351,9 @@ class LLMNarrator(Narrator):
             f"对方（{opp_role}）做了什么": (
                 view.get("their_performances", [])[-1:] or actor_text
             ),
-            "判定结果": verdict,
+            # 不喂原始骰值：那会让模型把「掷骰 17」写进叙事里，
+            # 把内部机制暴露给玩家。只给「奏效/没奏效」的写作指导。
+            "对方这一手": "奏效了" if verdict and verdict.get("success") else "没有达到目的",
             "你察觉到的线索": view.get("your_clues", []),
         }, ensure_ascii=False)
 
@@ -551,32 +564,112 @@ def render_verdict(verdict: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 7. 交互：hot-seat 双人
+# 7. 交互界面
+#
+#    设计原则：一屏之内必须能回答四个问题
+#      我是谁？现在什么情况？对方说过什么？我掌握了什么？
+#    凡是「该由玩家自己推断」的东西，界面一律不给。
 # ---------------------------------------------------------------------------
 
+W = 62
+
+
 def clear() -> None:
-    print("\n" * 40)
+    """真 tty 时用 ANSI 清屏；管道输出时用换行，避免脏字符。"""
+    if sys.stdout.isatty():
+        print("\033[2J\033[H", end="")
+    else:
+        print("\n" * 50)
+
+
+def header(text: str) -> None:
+    print("═" * W)
+    print(f" {text}")
+    print("═" * W)
+
+
+def section(title: str) -> None:
+    print(f"\n〔{title}〕")
+
+
+def para(text: str, mark: Optional[str] = None) -> None:
+    """按宽度折行。mark 给第一行加前缀，后续行对齐。"""
+    text = (text or "").strip()
+    pad = f"  {mark} " if mark else "  "
+    cont = " " * (len(pad) - 1) + " "
+    lines = textwrap.wrap(text, W - len(pad)) or [""]
+    for i, line in enumerate(lines):
+        print((pad if i == 0 else cont) + line)
+
+
+def render_screen(enc: Encounter, side: str, narrative: Optional[str]) -> None:
+    """
+    单方视角界面。
+
+    只呈现 side 有权知道的事：
+      对方说过的话（纯文本，不给动作类型）、对方的判定结果、对方的气势，一律不出现。
+    """
+    role = getattr(enc.script, f"role_{side.lower()}")
+    selfv = Channels.build_self_view(enc, side, enc.turn - 1)
+    oppv = Channels.build_opponent_view(enc, side, enc.turn - 1)
+
+    header(f"{enc.script.title} · 第 {enc.turn} 回合 · 你是「{role}」")
+
+    section("此刻")
+    para(selfv["premise"])
+
+    if narrative:
+        section("刚才")
+        para(narrative)
+
+    their = oppv["their_performances"]
+    if their:
+        section("对方说过 / 做过的")
+        for p in their[-4:]:
+            para(f"「{p['text']}」", "·")
+
+    if selfv["your_clues"]:
+        section("你察觉到的")
+        for c in selfv["your_clues"]:
+            para(c, "·")
+
+    if selfv["your_intents"]:
+        section("你没说出口的")
+        for i in selfv["your_intents"][-2:]:
+            para(i["text"], "·")
+
+    print()
+    print("─" * W)
+    lev = selfv["your_leverage"]
+    print(f" 你的气势 {'+' if lev >= 0 else ''}{lev}"
+          f"     行动 {enc.turn}/{enc.script.max_turns}")
+    print("─" * W)
 
 
 def player_input(side: str, enc: Encounter) -> tuple[str, str, str]:
-    print(f"\n【当前行动方：{side}】")
-    print("动作类型：")
-    for i, (k, label) in enumerate(ACTION_LABELS.items(), 1):
-        print(f"  {i}. {label}（DC {enc.script.dc.get(k, 13)}）")
+    keys = list(ACTION_LABELS)
+    print("\n【你这一回合怎么做？】")
+    for i, k in enumerate(keys, 1):
+        print(f"  {i}. {ACTION_LABELS[k]:　<10} DC {enc.script.dc.get(k, 13)}")
+    print("  （动作类型只用于判定；具体怎么做，写在下面。）")
     while True:
-        sel = input("选择 1-6：").strip()
-        if sel.isdigit() and 1 <= int(sel) <= 6:
-            action_type = list(ACTION_LABELS)[int(sel) - 1]
+        sel = input("\n选择 1-6：").strip()
+        if sel.isdigit() and 1 <= int(sel) <= len(keys):
+            action_type = keys[int(sel) - 1]
             break
-    text = input("你怎么做 / 说什么（自由描述）：").strip() or "（沉默）"
-    intent = input("【可选】你真实的想法（留空=不让系统知道；填了可能被识破）：").strip()
+        print("  请输入 1-6。")
+    text = input("你怎么做 / 说什么：").strip() or "（沉默不语）"
+    intent = input("你真实的打算（可留空；留空=不会被识破）：").strip()
     return action_type, text, intent
 
 
 MOCK_AI_B = [
-    ("threaten", "别过来！你身上有刀是不是？", "他是通缉犯的手下，想抢我"),
-    ("observe", "……你到底想干什么？", "我要先看清他有没有武器"),
-    ("persuade", "救我，到了镇上我给你双倍的钱。", "先哄住他，等伤好一点再说"),
+    ("threaten", "别过来！你身上带着刀，我看得出来。", "他是通缉犯的人，先吓住他"),
+    ("observe", "……你到底想从我这儿得到什么？", "得先看清他有没有同伙"),
+    ("persuade", "救我，到了镇上我给你双倍的钱。", "先许个空头，等伤好再说"),
+    ("threaten", "你要真敢动手，那个山洞里的人不会放过你。", "我在诈他，赌他不敢赌"),
+    ("help", "……水囊能给我吗？", ""),
+    ("persuade", "你不像坏人。但你也不像好人。", "试探他到底图什么"),
 ]
 
 
@@ -587,64 +680,65 @@ def play(solo: bool) -> None:
         script=SCRIPT_ROAD,
         seed=os.urandom(32),
     )
+    ai_side = "B" if solo else None
     if solo:
         enc.realness["B"] = "ai_fallback"
     ai_idx = 0
+    pending_narrative: Optional[str] = None
 
-    print("=" * 64)
-    print(f"  {enc.script.title}    {enc.enc_id}")
-    print("=" * 64)
-    print("\n[提示] hot-seat：每次行动后请把屏幕交给对方。\n")
+    clear()
+    header(f"{enc.script.title}")
+    print()
+    para("这是一次「匿名对位」——你和另一个人被困在同一个场景里。")
+    para("你们看到的东西不一样，谁也不知道对面是谁，甚至不知道对面是不是真人。")
+    if solo:
+        para("你的对手由 AI 扮演。")
+    else:
+        para("双人同机：每次行动后把屏幕交给对方。往上滚看历史算作弊。")
+    input("\n  按 Enter 开始……")
 
     while not enc.outcome and enc.turn <= enc.script.max_turns:
         side = enc.pending
-        clear()
 
-        # 该方视角（含自己的 intent）
-        selfv = Channels.build_self_view(enc, side, enc.turn - 1)
-        print(f"【你是：{selfv['role']}】\n")
-        print(textwrap.fill(selfv["premise"], 60))
-        if selfv["your_intents"]:
-            print("\n你之前没说过的心思：")
-            for it in selfv["your_intents"][-2:]:
-                print(f"  · {it['text']}")
-        clues = enc.disclosed.get(side, [])
-        if clues:
-            print("\n你察觉到的：")
-            for c in clues:
-                print(f"  · {c}")
-        print(f"\n第 {enc.turn} 回合 · 双方气势 A:{enc.leverage['A']} B:{enc.leverage['B']}")
-
-        # 对方的表演历史
-        for p in [x for x in enc.performances if x.actor != side][-3:]:
-            print(f"\n  对方（{ACTION_LABELS[p.action_type]}）：{p.text}")
-
-        if solo and side == "B":
+        # ---- AI 回合：不渲染界面，直接行动，产出「给人类看」的叙事 ----
+        if solo and side == ai_side:
             at, txt, it = MOCK_AI_B[min(ai_idx, len(MOCK_AI_B) - 1)]
             ai_idx += 1
-            print(f"\n  [B 由 AI 接管] {txt}")
-        else:
-            at, txt, it = player_input(side, enc)
+            res = submit(enc, side, at, txt, it, narrator)
+            pending_narrative = res["narrative"]
+            continue
+
+        # ---- 人类回合 ----
+        clear()
+        render_screen(enc, side, pending_narrative)
+        pending_narrative = None
+        at, txt, it = player_input(side, enc)
 
         res = submit(enc, side, at, txt, it, narrator)
 
+        # 判定明账只给行动方自己看
         clear()
-        print(f"【判定】{render_verdict(res['verdict'])}\n")
-        print(textwrap.fill(res["narrative"], 60))
+        header("这一手的结果" + ("（只有你自己看得到）" if not solo else ""))
+        print(f"\n  {render_verdict(res['verdict'])}")
+        if not solo:
+            input("\n  请把屏幕交给对方，按 Enter 继续……")
+        pending_narrative = res["narrative"]
 
-    # 结算 + 揭面
+    # ---- 结算 + 揭面 ----
     clear()
-    print("=" * 64)
-    print("  遭遇结束")
-    print("=" * 64)
-    print(f"\n结果：{enc.outcome or '时间耗尽'}")
-    print(f"气势：A {enc.leverage['A']}   B {enc.leverage['B']}")
-    print(f"判定记录：{len(enc.performances)} 次")
-    print("\n--- 揭面（可选）---")
-    print("双方形象与穿搭在此展示：")
-    print("  A：行商 · 深灰粗呢斗篷 / 皮质护腕 / 未换的旧靴")
-    print("  B：" + ("（AI 扮演，无形象）" if solo else "军人 · 残破护甲 / 沾泥的绑腿"))
-    print("\n[原始文本已全量落库（此处为内存态，M1 接 MySQL）]")
+    header("遭遇结束")
+    print()
+    para(f"结果：{enc.outcome or '时间耗尽'}")
+    print(f"  你的气势 {'+' if enc.leverage.get('A', 0) >= 0 else ''}{enc.leverage.get('A', 0)}"
+          f"     判定记录 {len(enc.performances)} 次")
+    print()
+    print("─" * W)
+    print(" 揭面（可选）—— 这是本作唯一的社交展示位")
+    print("─" * W)
+    para("A：行商 · 深灰粗呢斗篷 / 皮质护腕 / 未换的旧靴", "·")
+    para("B：" + ("（AI 扮演，无形象）" if solo else "军人 · 残破护甲 / 沾泥的绑腿"), "·")
+    print()
+    para("[原始文本已全量落库（当前为内存态，M1 接 MySQL）]")
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +822,45 @@ def redteam() -> int:
     if not (1 <= a <= 20):
         failures.append("Case5: 骰子越界")
 
+    # --- Case 6: 对方的动作类型不得下发给玩家 ---
+    #     玩家该从「他说了什么」自己推断他在威胁还是在示弱。
+    enc6 = Encounter(enc_id="redteam-6", script=SCRIPT_ROAD, seed=b"\x06" * 32)
+    enc6.performances.append(
+        Performance(turn=1, actor="B", action_type="threaten",
+                    text="那个山洞里的人不会放过你。",
+                    judged={"roll": 15, "dc": 15, "modifier": 0,
+                            "modifier_source": "无", "total": 15, "success": True})
+    )
+    v6 = Channels.build_opponent_view(enc6, "A", 2)
+    if any("action_type" in p for p in v6["their_performances"]):
+        failures.append("Case6: 对方视图泄露了 action_type（等于公布答案）")
+    if any("judged" in p for p in v6["their_performances"]):
+        failures.append("Case6: 对方视图泄露了判定结果")
+    if not v6["their_performances"]:
+        failures.append("Case6: 对方表演文本丢失（隔离过度）")
+
+    # --- Case 7: 不得看到对方的气势 ---
+    enc7 = Encounter(enc_id="redteam-7", script=SCRIPT_ROAD, seed=b"\x07" * 32)
+    enc7.leverage = {"A": 2, "B": 3}
+    v7a = Channels.build_opponent_view(enc7, "A", 1)
+    v7s = Channels.build_self_view(enc7, "A", 1)
+    if v7a.get("your_leverage") != 2:
+        failures.append("Case7: 自己的气势取值错误")
+    blob7 = json.dumps(v7a, ensure_ascii=False) + json.dumps(v7s, ensure_ascii=False)
+    if "leverage\": {" in blob7 or "'B': 3" in blob7:
+        failures.append("Case7: 泄露了对方的 leverage 结构")
+    if 3 in v7a.values() or 3 in v7s.values():
+        failures.append("Case7: 对方的 leverage 数值 3 出现在 A 的视图里")
+
+    # --- Case 8: 完整枚举对比 —— 视图字段白名单 ---
+    allowed_opp = {"role", "premise", "their_performances", "your_clues", "your_leverage"}
+    allowed_self = {"role", "premise", "your_performances", "your_intents",
+                    "your_clues", "your_leverage"}
+    if set(v7a) - allowed_opp:
+        failures.append(f"Case8: opponent_view 出现未预期字段 {set(v7a) - allowed_opp}")
+    if set(v7s) - allowed_self:
+        failures.append(f"Case8: self_view 出现未预期字段 {set(v7s) - allowed_self}")
+
     print()
     if failures:
         for f in failures:
@@ -735,10 +868,12 @@ def redteam() -> int:
         return 1
     print("  全部通过：")
     print("    · 未授权时 intent 原文零泄露")
-    print("    · 观察失败不泄露")
-    print("    · 观察成功只给摘要，不给原文")
+    print("    · 观察失败不泄露 / 观察成功只给摘要")
     print("    · 视图构建函数签名不接受 intent")
     print("    · 骰子可复现、与行动方相关、值域正确")
+    print("    · 对方的 action_type 与判定结果不下发")
+    print("    · 对方的气势不泄露，只给自己的")
+    print("    · 视图字段白名单，无未预期字段")
     return 0
 
 
@@ -861,6 +996,157 @@ def selftest() -> int:
 
 
 # ---------------------------------------------------------------------------
+# 10. Agent 模式
+#
+#     让任意 coding agent（Claude Code / DeepSeek Harness / WorkBuddy / ...）
+#     都能主持一局。引擎只输出**结构化状态**，叙事由 agent 自己写。
+#
+#     这样做的两个好处：
+#       1. 不需要 API key —— 玩家用自己的 agent 订阅
+#       2. agent 就是 GM，天然有自然语言能力
+#
+#     代价：agent 同时知道双方视角，它的"自觉"是隔离的最后一环。
+#     缓解：view 命令只返回该方可见的东西，agent 拿不到多余信息。
+# ---------------------------------------------------------------------------
+
+SCRIPTS = {SCRIPT_ROAD.script_id: SCRIPT_ROAD}
+
+
+def enc_to_dict(enc: Encounter) -> dict:
+    return {
+        "encId": enc.enc_id,
+        "scriptId": enc.script.script_id,
+        "seed": base64.b64encode(enc.seed).decode(),
+        "state": enc.state,
+        "turn": enc.turn,
+        "outcome": enc.outcome,
+        "leverage": enc.leverage,
+        "realness": enc.realness,
+        "disclosed": enc.disclosed,
+        "performances": [
+            {"turn": p.turn, "actor": p.actor, "action_type": p.action_type,
+             "text": p.text, "judged": p.judged}
+            for p in enc.performances
+        ],
+        "intents": [
+            {"turn": i.turn, "actor": i.actor, "text": i.text} for i in enc.intents
+        ],
+    }
+
+
+def enc_from_dict(d: dict) -> Encounter:
+    script = SCRIPTS.get(d["scriptId"])
+    if script is None:
+        raise SystemExit(f"未知脚本 {d['scriptId']}，可用：{list(SCRIPTS)}")
+    enc = Encounter(
+        enc_id=d["encId"], script=script,
+        seed=base64.b64decode(d["seed"]),
+        state=d["state"], turn=d["turn"],
+    )
+    enc.outcome = d.get("outcome")
+    enc.leverage = d["leverage"]
+    enc.realness = d.get("realness", enc.realness)
+    enc.disclosed = d.get("disclosed", {"A": [], "B": []})
+    enc.performances = [Performance(**p) for p in d.get("performances", [])]
+    enc.intents = [Intent(**i) for i in d.get("intents", [])]
+    return enc
+
+
+def agent_view(enc: Encounter, side: str) -> dict:
+    """
+    只返回 side 有权知道的事。
+    不含：对方的动作类型、对方的判定结果、对方的气势、任何 Intent。
+    """
+    opp = enc.other(side)
+    oppv = Channels.build_opponent_view(enc, side, enc.turn - 1)
+    selfv = Channels.build_self_view(enc, side, enc.turn - 1)
+    return {
+        "title": enc.script.title,
+        "turn": enc.turn,
+        "maxTurns": enc.script.max_turns,
+        "you": side,
+        "yourRole": getattr(enc.script, f"role_{side.lower()}"),
+        "theirRole": getattr(enc.script, f"role_{opp.lower()}"),
+        "premise": selfv["premise"],
+        "theirPerformances": [p["text"] for p in oppv["their_performances"]],
+        "yourClues": selfv["your_clues"],
+        "yourIntents": [i["text"] for i in selfv["your_intents"]],
+        "yourLeverage": selfv["your_leverage"],
+        "pending": enc.pending,
+        "finished": bool(enc.outcome),
+        "outcome": enc.outcome,
+        "dc": enc.script.dc,
+        "actionTypes": list(ACTION_LABELS),
+    }
+
+
+def agent_cmd(cmd: str, state_path: str, side: str, action_type: Optional[str],
+              text: Optional[str], intent: str, realness: str) -> int:
+    if cmd == "start":
+        enc = Encounter(
+            enc_id=f"enc-{os.urandom(3).hex()}",
+            script=SCRIPT_ROAD,
+            seed=os.urandom(32),
+        )
+        enc.realness[enc.other(side)] = realness
+        json.dump(enc_to_dict(enc), open(state_path, "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=1)
+        print(json.dumps({"ok": True, "cmd": "start", "view": agent_view(enc, side)},
+                         ensure_ascii=False, indent=1))
+        return 0
+
+    if not os.path.exists(state_path):
+        print(json.dumps({"ok": False, "error": f"状态文件不存在：{state_path}。先跑 --agent start"},
+                         ensure_ascii=False))
+        return 1
+    enc = enc_from_dict(json.load(open(state_path, encoding="utf-8")))
+
+    if cmd == "view":
+        print(json.dumps({"ok": True, "cmd": "view", "view": agent_view(enc, side)},
+                         ensure_ascii=False, indent=1))
+        return 0
+
+    if cmd == "status":
+        print(json.dumps({"ok": True, "cmd": "status", "state": enc_to_dict(enc)},
+                         ensure_ascii=False, indent=1))
+        return 0
+
+    if cmd == "act":
+        if enc.outcome:
+            print(json.dumps({"ok": False, "error": "本局已结束"}, ensure_ascii=False))
+            return 1
+        if enc.pending != side:
+            print(json.dumps({"ok": False,
+                              "error": f"现在轮到 {enc.pending}，不是 {side}"},
+                             ensure_ascii=False))
+            return 1
+        if action_type not in ACTION_LABELS:
+            print(json.dumps({"ok": False,
+                              "error": f"动作类型必须是 {list(ACTION_LABELS)}"},
+                             ensure_ascii=False))
+            return 1
+
+        res = submit(enc, side, action_type, text or "（沉默不语）", intent,
+                     MockNarrator())
+        json.dump(enc_to_dict(enc), open(state_path, "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=1)
+        print(json.dumps({
+            "ok": True,
+            "cmd": "act",
+            "actor": side,
+            "verdict": res["verdict"],
+            "verdictText": render_verdict(res["verdict"]),
+            "nextTurn": enc.pending,
+            "nextView": agent_view(enc, enc.pending),
+        }, ensure_ascii=False, indent=1))
+        return 0
+
+    print(json.dumps({"ok": False, "error": f"未知命令 {cmd}；可用 start/view/act/status"},
+                     ensure_ascii=False))
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -873,7 +1159,19 @@ def main() -> int:
     ap.add_argument("--matrix", action="store_true", help="intent 联动机制矩阵测试")
     ap.add_argument("--guardtest", action="store_true", help="输出质量闸门测试")
     ap.add_argument("--selftest", action="store_true", help="状态机与判定自检")
+    ap.add_argument("--agent", metavar="CMD",
+                    help="agent 模式：start | view | act | status（输出 JSON）")
+    ap.add_argument("--state", default=".enc_state.json", help="agent 模式状态文件")
+    ap.add_argument("--side", default="A", help="人类玩家是哪一方（A/B）")
+    ap.add_argument("--type", dest="action_type", help="动作类型")
+    ap.add_argument("--text", help="表演内容")
+    ap.add_argument("--intent", default="", help="内心（可选）")
+    ap.add_argument("--realness", default="ai_fallback", help="对方是真人是机")
     args = ap.parse_args()
+
+    if args.agent:
+        return agent_cmd(args.agent, args.state, args.side, args.action_type,
+                         args.text, args.intent, args.realness)
 
     if args.redteam:
         return redteam()
