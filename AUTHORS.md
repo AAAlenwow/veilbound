@@ -88,7 +88,7 @@ git log --format=%H -1 | xargs ots stamp
 
 ```
 Alen (hechao). Veilbound: anonymous dual-perspective asynchronous narrative game.
-Design notes, 2026. <repository URL>
+Design notes, 2026. https://github.com/AAAlenwow/veilbound
 ```
 
 ---
