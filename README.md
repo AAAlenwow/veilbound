@@ -85,7 +85,8 @@
 ```bash
 git clone <this-repo> && cd ai-infinite-game/m0-prototype
 
-python3 m0.py --play --solo      # 玩一局
+python3 m0.py --play --solo      # 玩一局（雨夜驿道）
+# 悬疑副本通过 agent 模式进入：--script ln-manor-01
 python3 m0.py --redteam          # 三通道泄露测试
 python3 m0.py --matrix           # intent 联动机制测试
 python3 m0.py --guardtest        # 输出质量闸门测试

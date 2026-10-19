@@ -28,8 +28,8 @@ description: 主持一局「匿名对位」叙事博弈游戏。玩家和一个�
 引擎命令（全部输出 JSON 到 stdout）：
 
 ```bash
-# 开局（--side 指定人类玩家是哪一方）
-python3 m0.py --agent start --state .enc.json --side A
+# 开局（--side 指定人类玩家是哪一方；--script 选副本）
+python3 m0.py --agent start --state .enc.json --side A --script ln-manor-01
 
 # 看当前方视角
 python3 m0.py --agent view --state .enc.json --side A
@@ -43,6 +43,20 @@ python3 m0.py --agent status --state .enc.json
 ```
 
 动作类型：`persuade` 说服 / `threaten` 威胁 / `observe` 观察 / `attack` 动手 / `help` 帮助 / `leave` 离开。
+
+可用副本：
+- `ln-road-01`《雨夜驿道》—— 行商 × 重伤军人（教学）
+- `ln-manor-01`《雨夜·十九点四十》—— 守夜人 × 寻人的妹妹（悬疑，三环推理）
+
+### 标签（tag）：这个游戏真正的核心
+
+玩家填「内心」时，可以额外标记**自己在藏哪一件事**。
+`view.tagOptions` 会给出该角色可选的标签。
+
+**标记了，才可能被对方看穿。** 对方观察成功时，拿到的就是这条标签对应的确定线索；
+没标记，观察成功也什么都拿不到。
+
+所以：**填内心是一次自愿下注**。填真的可能被识破，填假的可以钓鱼。
 
 ## 主持流程
 
@@ -62,7 +76,7 @@ python3 m0.py --agent status --state .enc.json
 
 绝对不可以：
 
-- 说出对手的 `intent`（内心）。你根本不会从 `view` 里拿到它——拿到了就是 bug
+- 说出对手的 `intent`（内心）或它的 `tag`。你根本不会从 `view` 里拿到它们——拿到了就是 bug
 - 说出对手用了什么**动作类型**（"他在威胁你"）。玩家必须从**他说的话**里自己推断
 - 说出对手的**判定结果**（"他的试探成功了"）
 - 说出对手的**气势数值**

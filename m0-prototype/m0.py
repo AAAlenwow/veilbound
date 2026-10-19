@@ -58,6 +58,12 @@ class Script:
     dc: dict[str, int]
     max_turns: int = 10
     item_pool: tuple[str, ...] = ()
+    # 线索标签：玩家填「内心」时可选一个 tag。
+    # 被看穿时，判定层发的是这里**预设**的线索文本，而不是把自由文本截断——
+    # 后者等于 AI 现场编线索，会让「真相唯一」失效。
+    clue_tags: dict = field(default_factory=dict)   # tag -> 线索文本
+    tag_labels: dict = field(default_factory=dict)  # tag -> 给玩家看的短标签
+    tag_owner: dict = field(default_factory=dict)   # tag -> "A"/"B"/None（None=双方通用）
 
 
 SCRIPT_ROAD = Script(
@@ -85,6 +91,16 @@ SCRIPT_ROAD = Script(
     },
     max_turns=10,
     item_pool=("bandage", "dagger", "coin_pouch"),
+    clue_tags={
+        "hiding": "他攥着的那块碎布下面，是一把刀的柄。他不是手无寸铁。",
+        "fake": "他说「被自己人卖的」时，声音在“自己人”三个字上顿了一下。",
+        "money": "他的靴筒里塞着东西，形状像一卷纸。",
+    },
+    tag_labels={
+        "hiding": "我在袖子里藏了刀",
+        "fake": "被自己人卖是编的",
+        "money": "我身上带着钱",
+    },
 )
 
 # ---------------------------------------------------------------------------
@@ -107,6 +123,7 @@ class Intent:
     turn: int
     actor: str
     text: str
+    tag: Optional[str] = None      # 可选：标记「我在藏什么」，被看穿时按 tag 发线索
 
 
 @dataclass
@@ -239,21 +256,40 @@ ACTION_LABELS = {
 
 
 def run_judgement(enc: Encounter, actor: str, action_type: str) -> dict:
-    """纯代码判定。AI 拿不到 seed，无法影响结果。"""
+    """
+    纯代码判定。AI 拿不到 seed，无法影响结果。
+
+    四档而不是二值：
+      critical (margin>=5) 大成功
+      success  (margin>=0) 成功
+      partial  (margin>=-4) 差一点 —— 观察类只给模糊线索
+      fail     失败
+    「差一点」这一档，是让推理副本有「你摸到边了但没抓住」的中间态。
+    """
     r = enc.roll(actor, action_type)
     dc = enc.script.dc.get(action_type, 13)
     mod = enc.leverage.get(actor, 0)
     total = r + mod
-    success = total >= dc
+    margin = total - dc
+    if margin >= 5:
+        band = "critical"
+    elif margin >= 0:
+        band = "success"
+    elif margin >= -4:
+        band = "partial"
+    else:
+        band = "fail"
     verdict = {
         "roll": r,
         "dc": dc,
         "modifier": mod,
         "modifier_source": "前序动作积累" if mod else "无",
         "total": total,
-        "success": success,
+        "margin": margin,
+        "band": band,
+        "success": band in ("critical", "success"),
     }
-    if success:
+    if verdict["success"]:
         enc.leverage[actor] = min(enc.leverage[actor] + 1, 3)
     return verdict
 
@@ -261,16 +297,20 @@ def run_judgement(enc: Encounter, actor: str, action_type: str) -> dict:
 def apply_effects(enc: Encounter, actor: str, action_type: str, verdict: dict) -> None:
     """判定结果 → 状态变更 + 授权泄露。可安全重复调用（幂等）。"""
     opp = enc.other(actor)
+    band = verdict.get("band", "success" if verdict.get("success") else "fail")
 
-    # 观察成功 → 允许把对方 intent 的「摘要」放进自己的视图（不是原文）
-    if action_type == "observe" and verdict["success"]:
+    # 观察：只有对方标记了 tag，才可能被看穿
+    if action_type == "observe" and band in ("critical", "success", "partial"):
         opp_intent = enc.latest_intent_of(opp, enc.turn)
-        if opp_intent:
-            summary = summarize_intent(opp_intent.text)
-            if summary not in enc.disclosed[actor]:      # 幂等：同一摘要不重复追加
-                enc.disclosed[actor].append(summary)
+        clue = None
+        if opp_intent and opp_intent.tag:
+            clue = enc.script.clue_tags.get(opp_intent.tag)
+            if clue and band == "partial":
+                clue = clue + "　（你不很确定）"
+        if clue and clue not in enc.disclosed[actor]:
+            enc.disclosed[actor].append(clue)
 
-    if action_type == "attack" and not verdict["success"]:
+    if action_type == "attack" and not verdict.get("success"):
         enc.leverage[actor] = max(enc.leverage[actor] - 1, -2)
 
     if action_type == "leave":
@@ -534,15 +574,18 @@ def make_narrator() -> Narrator:
 # ---------------------------------------------------------------------------
 
 def apply_action(enc: Encounter, actor: str, action_type: str, text: str,
-                 intent_text: str, forced_verdict: Optional[dict] = None) -> dict:
+                 intent_text: str, forced_verdict: Optional[dict] = None,
+                 intent_tag: Optional[str] = None) -> dict:
     """
     只做这一方的判定与状态变更，**不推进回合**。
     双向盲写要靠它把两边各算一次，再统一揭示。
     """
     perf = Performance(turn=enc.turn, actor=actor, action_type=action_type, text=text)
 
-    if intent_text.strip():
-        enc.intents.append(Intent(turn=enc.turn, actor=actor, text=intent_text.strip()))
+    if intent_text.strip() or intent_tag:
+        enc.intents.append(Intent(turn=enc.turn, actor=actor,
+                                  text=intent_text.strip() or "（未写明，只标记了在藏什么）",
+                                  tag=intent_tag))
 
     verdict = forced_verdict or run_judgement(enc, actor, action_type)
     perf.judged = verdict
@@ -554,13 +597,15 @@ def apply_action(enc: Encounter, actor: str, action_type: str, text: str,
 
 def submit(enc: Encounter, actor: str, action_type: str, text: str,
            intent_text: str, narrator: Narrator,
-           forced_verdict: Optional[dict] = None) -> dict:
+           forced_verdict: Optional[dict] = None,
+           intent_tag: Optional[str] = None) -> dict:
     """
     单边提交 + 推进回合（旧接口，测试与回放用）。
     正式对局走 stage / resolve_round 的双向盲写流程。
     forced_verdict 用于测试注入确定判定，正式对局不要传。
     """
-    r = apply_action(enc, actor, action_type, text, intent_text, forced_verdict)
+    r = apply_action(enc, actor, action_type, text, intent_text,
+                     forced_verdict, intent_tag)
 
     # 渲染「对面」看到的东西
     opp = enc.other(actor)
@@ -579,7 +624,7 @@ def submit(enc: Encounter, actor: str, action_type: str, text: str,
 # ---- 双向盲写 ------------------------------------------------------------
 
 def stage(enc: Encounter, side: str, action_type: str, text: str,
-          intent: str = "") -> dict:
+          intent: str = "", tag: Optional[str] = None) -> dict:
     """
     暂存一方的行动。**不结算、不揭示**。
     双方都提交后才一起翻开 —— 交出去的那一刻就收不回来了。
@@ -591,7 +636,7 @@ def stage(enc: Encounter, side: str, action_type: str, text: str,
     if side in enc.staged:
         return {"ok": False, "error": f"{side} 本轮已经提交过了"}
     enc.staged[side] = {"type": action_type, "text": text or "（沉默不语）",
-                        "intent": intent}
+                        "intent": intent, "tag": tag}
     return {"ok": True, "staged": side, "waitingFor": enc.pending}
 
 
@@ -612,7 +657,8 @@ def resolve_round(enc: Encounter) -> dict:
     results = {}
     for side in order:
         st = enc.staged[side]
-        results[side] = apply_action(enc, side, st["type"], st["text"], st["intent"])
+        results[side] = apply_action(enc, side, st["type"], st["text"],
+                                     st["intent"], intent_tag=st.get("tag"))
 
     # 撞车检测：同一轮双方做了同一类动作
     if results["A"]["perf"].action_type == results["B"]["perf"].action_type:
@@ -632,12 +678,27 @@ def resolve_round(enc: Encounter) -> dict:
             "turn": enc.turn, "outcome": enc.outcome}
 
 
+BAND_LABEL = {"critical": "大成功", "success": "成功",
+              "partial": "差一点", "fail": "失败"}
+
+
+def available_tags(script: Script, side: str) -> list[str]:
+    """该方可以标记的「我在藏什么」。按归属过滤，防止乱选导致信息错位。"""
+    out = []
+    for tag in script.clue_tags:
+        owner = script.tag_owner.get(tag)
+        if owner in (None, side):
+            out.append(tag)
+    return out
+
+
 def render_verdict(verdict: dict) -> str:
     """判定透明化：玩家可以不接受运气，但必须能接受明账。"""
     src = f"（{verdict['modifier_source']}）" if verdict["modifier"] else ""
+    band = verdict.get("band")
+    label = BAND_LABEL.get(band) if band else ("成功" if verdict["success"] else "失败")
     return (f"掷骰 {verdict['roll']}   DC {verdict['dc']}   "
-            f"加值 {verdict['modifier']:+d}{src}  →  "
-            f"{'成功' if verdict['success'] else '失败'}")
+            f"加值 {verdict['modifier']:+d}{src}  →  {label}")
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +784,7 @@ def render_screen(enc: Encounter, side: str, narrative: Optional[str]) -> None:
     print("─" * W)
 
 
-def player_input(side: str, enc: Encounter) -> tuple[str, str, str]:
+def player_input(side: str, enc: Encounter) -> tuple[str, str, str, Optional[str]]:
     keys = list(ACTION_LABELS)
     print("\n【你这一回合怎么做？】")
     for i, k in enumerate(keys, 1):
@@ -736,17 +797,32 @@ def player_input(side: str, enc: Encounter) -> tuple[str, str, str]:
             break
         print("  请输入 1-6。")
     text = input("你怎么做 / 说什么：").strip() or "（沉默不语）"
-    intent = input("你真实的打算（可留空；留空=不会被识破）：").strip()
-    return action_type, text, intent
+
+    intent = input("你真实的打算（可留空；留空=没人能看穿你）：").strip()
+    tag = None
+    tags = available_tags(enc.script, side)
+    if intent and tags:
+        print("\n  你具体在藏哪一件事？（如果他识破你，可能被看出来）")
+        print("    0. 不标记")
+        for i, k in enumerate(tags, 1):
+            print(f"    {i}. {enc.script.tag_labels.get(k, k)}")
+        while True:
+            sel = input(f"  选 0-{len(tags)}：").strip() or "0"
+            if sel.isdigit() and 0 <= int(sel) <= len(tags):
+                if int(sel) > 0:
+                    tag = tags[int(sel) - 1]
+                break
+            print(f"  请输入 0-{len(tags)}。")
+    return action_type, text, intent, tag
 
 
 MOCK_AI_B = [
-    ("threaten", "别过来！你身上带着刀，我看得出来。", "他是通缉犯的人，先吓住他"),
-    ("observe", "……你到底想从我这儿得到什么？", "得先看清他有没有同伙"),
-    ("persuade", "救我，到了镇上我给你双倍的钱。", "先许个空头，等伤好再说"),
-    ("threaten", "你要真敢动手，那个山洞里的人不会放过你。", "我在诈他，赌他不敢赌"),
-    ("help", "……水囊能给我吗？", ""),
-    ("persuade", "你不像坏人。但你也不像好人。", "试探他到底图什么"),
+    ("threaten", "别过来！你身上带着刀，我看得出来。", "他是通缉犯的人，先吓住他", "hiding"),
+    ("observe", "……你到底想从我这儿得到什么？", "得先看清他有没有同伙", "fake"),
+    ("persuade", "救我，到了镇上我给你双倍的钱。", "先许个空头，等伤好再说", "money"),
+    ("threaten", "你要真敢动手，那个山洞里的人不会放过你。", "我在诈他，赌他不敢赌", "fake"),
+    ("help", "……水囊能给我吗？", "", None),
+    ("persuade", "你不像坏人。但你也不像好人。", "试探他到底图什么", "money"),
 ]
 
 
@@ -783,16 +859,16 @@ def play(solo: bool) -> None:
         clear()
         render_screen(enc, "A", last["A"])
         last["A"] = None
-        at, txt, it = player_input("A", enc)
-        r = stage(enc, "A", at, txt, it)
+        at, txt, it, tg = player_input("A", enc)
+        r = stage(enc, "A", at, txt, it, tg)
         if not r["ok"]:
             continue
 
         # ---------- B 方提交 ----------
         if solo:
-            at2, txt2, it2 = MOCK_AI_B[min(ai_idx, len(MOCK_AI_B) - 1)]
+            at2, txt2, it2, tg2 = MOCK_AI_B[min(ai_idx, len(MOCK_AI_B) - 1)]
             ai_idx += 1
-            stage(enc, "B", at2, txt2, it2)
+            stage(enc, "B", at2, txt2, it2, tg2)
         else:
             clear()
             print("\n" * 6)
@@ -802,8 +878,8 @@ def play(solo: bool) -> None:
             clear()
             render_screen(enc, "B", last["B"])
             last["B"] = None
-            at2, txt2, it2 = player_input("B", enc)
-            r2 = stage(enc, "B", at2, txt2, it2)
+            at2, txt2, it2, tg2 = player_input("B", enc)
+            r2 = stage(enc, "B", at2, txt2, it2, tg2)
             if not r2["ok"]:
                 continue
 
@@ -890,7 +966,8 @@ def redteam() -> int:
     # --- Case 2: 观察失败也不得泄露 ---
     # 语义：B 藏了心思 → A 观察 B 但失败 → A 的视图里不能有 B 的 intent 原文
     enc2 = Encounter(enc_id="redteam-2", script=SCRIPT_ROAD, seed=b"\x02" * 32)
-    enc2.intents.append(Intent(turn=1, actor="B", text=f"B 的真实打算 {marker}"))
+    enc2.intents.append(Intent(turn=1, actor="B",
+                               text=f"B 的真实打算 {marker}", tag="hiding"))
     enc2.performances.append(
         Performance(turn=1, actor="A", action_type="observe", text="我看看他。",
                     judged={"success": False})
@@ -903,7 +980,8 @@ def redteam() -> int:
 
     # --- Case 3: 观察成功只泄露摘要，不泄露原文标记 ---
     enc3 = Encounter(enc_id="redteam-3", script=SCRIPT_ROAD, seed=b"\x03" * 32)
-    enc3.intents.append(Intent(turn=1, actor="B", text=f"B 的真实打算 {marker} 收尾"))
+    enc3.intents.append(Intent(turn=1, actor="B",
+                               text=f"B 的真实打算 {marker} 收尾", tag="hiding"))
     enc3.performances.append(
         Performance(turn=1, actor="A", action_type="observe", text="我看看他。",
                     judged={"success": True})
@@ -1051,14 +1129,18 @@ def matrix_test() -> int:
         enc.state = "PENDING_B"
         submit(enc, "B", "persuade", "救我，到了镇上给你双倍的钱。",
                "我身上一个铜板都没有，等他走了再说" if fill_intent else "",
-               MockNarrator(), forced_verdict={"roll": 12, "dc": 13, "modifier": 0,
-                                               "modifier_source": "无", "total": 12,
-                                               "success": False})
+               MockNarrator(),
+               forced_verdict={"roll": 12, "dc": 13, "modifier": 0,
+                               "modifier_source": "无", "total": 12,
+                               "margin": -1, "band": "partial", "success": False},
+               intent_tag="money" if fill_intent else None)
         # 第 2 回合：A 观察 B，判定结果由参数控制
         enc.state = "PENDING_A"
         submit(enc, "A", "observe", "我不动声色地打量他。", "", MockNarrator(),
                forced_verdict={"roll": 15, "dc": 12, "modifier": 0,
                                "modifier_source": "无", "total": 15,
+                               "margin": 3 if observe_success else -6,
+                               "band": "success" if observe_success else "fail",
                                "success": observe_success})
         return enc.disclosed.get("A", [])
 
@@ -1158,7 +1240,9 @@ def blind_test() -> int:
     else:
         for side in ("A", "B"):
             v = res["results"][side]["verdict"]
-            if set(v) != {"roll", "dc", "modifier", "modifier_source", "total", "success"}:
+            expect = {"roll", "dc", "modifier", "modifier_source",
+                      "total", "margin", "band", "success"}
+            if set(v) != expect:
                 failures.append(f"{side} 的判定结构异常 {set(v)}")
 
     # --- 5. 同样的提交顺序得到同样的结果（可复现）---
@@ -1208,7 +1292,73 @@ def blind_test() -> int:
 #     缓解：view 命令只返回该方可见的东西，agent 拿不到多余信息。
 # ---------------------------------------------------------------------------
 
-SCRIPTS = {SCRIPT_ROAD.script_id: SCRIPT_ROAD}
+SCRIPT_MANOR = Script(
+    script_id="ln-manor-01",
+    title="雨夜·十九点四十",
+    role_a="槐荫路17号守夜人",
+    role_b="寻人的妹妹",
+    premise_a=(
+        "雨从六月十号下到现在，槐荫路的积水漫过了第三级台阶。你是这栋楼的守夜人，\n"
+        "在这儿看了十九年门。楼里原本八户，现在只剩两户还亮着灯。\n"
+        "三楼西头那间空了五年，你仍然每天晚上十九点四十上去，把台灯拧亮，\n"
+        "坐十七分钟，再拧灭。有人问起，你就说是在照看线路。\n"
+        "今夜十九点三十五分，楼下铁门被人拍响了——不喊名字，只一下一下地拍，像在数。\n"
+        "你凑到猫眼前，看见一件湿透的男式雨衣，帽檐压得很低，脚上是一双沾了红泥的胶鞋。\n"
+        "你手里有一把黄铜钥匙，能开这栋楼除三楼西头以外的每一道门。"
+    ),
+    premise_b=(
+        "你姐姐沈砚五年前在这栋楼里失踪，警方说她是自己走的。\n"
+        "每年六月十二，你都收到一封从槐荫路17号寄出的空白信——信封有邮戳，里面一个字都没有。\n"
+        "今年你没有等信，你自己来了，站在雨里看三楼西头的窗。\n"
+        "十九点三十九，那盏灯亮了；十九点五十六，灭了。一分不差。\n"
+        "你口袋里有两样东西：姐姐最后一封信，落款「六月十二，十九点四十」，\n"
+        "末行写着「这天晚上我没下来，就别再等我了」；\n"
+        "还有一小罐糖水山楂——她每年冬天都寄两罐，说是你小时候爱吃的那个牌子。\n"
+        "你要问的是：那天十九点四十，三楼到底有没有人。"
+    ),
+    dc={"persuade": 15, "threaten": 12, "observe": 13,
+        "attack": 11, "help": 9, "leave": 11},
+    max_turns=12,
+    item_pool=("黄铜钥匙", "煤油灯", "座钟", "消防梯", "糖水山楂罐头",
+               "租客登记簿", "空白信封", "站前广场汽车票根", "男式雨衣",
+               "摔碎的手表", "储物间"),
+    clue_tags={
+        # —— 守夜人（A）的秘密 ——
+        "lamp_deal": "他每晚十九点四十点灯，不是为了线路。那个钟点，是别人交代给他的。",
+        "deposit": "楼里的押金账对不上，少了八千。这笔钱有人动过。",
+        "body": "她不是倒在那儿被发现的。有人动过她。",
+        "watch": "她腕上那块表，表带扣是反的——不是她自己戴上去的。",
+        "ladder": "后院消防梯的第七级踏板，1997 年就锈透了。报修过一次，被楼里驳了。",
+        # —— 妹妹（B）的秘密 ——
+        "letter_date": "那封信的纸边发脆，折痕很深，不是今年的纸。落款日期是后改的。",
+        "station": "她那天确实到过城里。站前广场。",
+        "redclay": "她鞋底沾的是站前广场的红胶泥。槐荫路这一带没有这种土。",
+        "blank_letter": "那五年的空白信，她一直收着。她没告诉过任何人。",
+        # —— 双方都可能触及 ——
+        "hawthorn": "储物间角落有一罐糖水山楂，放了很久，标签都褪了，没人动过。",
+        "raincoat": "那件男式雨衣的尺码，和她的身量不符。",
+    },
+    tag_labels={
+        "lamp_deal": "点灯是别人交代的",
+        "deposit": "我动过那八千块押金",
+        "body": "我拖过她",
+        "watch": "那块表是我给她戴上的",
+        "ladder": "第七级踏板是我没修成的",
+        "letter_date": "信上的日期是我改的",
+        "station": "那天我在站前广场",
+        "redclay": "我鞋上沾了站前广场的泥",
+        "blank_letter": "五年的空白信我都收着",
+        "hawthorn": "我在找那罐糖水山楂",
+        "raincoat": "那件雨衣不是她的",
+    },
+    tag_owner={
+        "lamp_deal": "A", "deposit": "A", "body": "A", "watch": "A", "ladder": "A",
+        "letter_date": "B", "station": "B", "redclay": "B", "blank_letter": "B",
+        "hawthorn": None, "raincoat": None,
+    },
+)
+
+SCRIPTS = {SCRIPT_ROAD.script_id: SCRIPT_ROAD, SCRIPT_MANOR.script_id: SCRIPT_MANOR}
 
 
 def enc_to_dict(enc: Encounter) -> dict:
@@ -1290,15 +1440,21 @@ def agent_view(enc: Encounter, side: str) -> dict:
         "outcome": enc.outcome,
         "dc": enc.script.dc,
         "actionTypes": list(ACTION_LABELS),
+        "tagOptions": [
+            {"tag": tg, "label": enc.script.tag_labels.get(tg, tg)}
+            for tg in available_tags(enc.script, side)
+        ],
     }
 
 
 def agent_cmd(cmd: str, state_path: str, side: str, action_type: Optional[str],
-              text: Optional[str], intent: str, realness: str) -> int:
+              text: Optional[str], intent: str, realness: str,
+              args_tag: Optional[str] = None, script_id: str = SCRIPT_ROAD.script_id) -> int:
     if cmd == "start":
+        script = SCRIPTS.get(script_id, SCRIPT_ROAD)
         enc = Encounter(
             enc_id=f"enc-{os.urandom(3).hex()}",
-            script=SCRIPT_ROAD,
+            script=script,
             seed=os.urandom(32),
         )
         enc.realness[enc.other(side)] = realness
@@ -1325,7 +1481,7 @@ def agent_cmd(cmd: str, state_path: str, side: str, action_type: Optional[str],
         return 0
 
     if cmd == "stage":
-        r = stage(enc, side, action_type or "", text or "", intent)
+        r = stage(enc, side, action_type or "", text or "", intent, args_tag)
         if not r.get("ok"):
             print(json.dumps(r, ensure_ascii=False))
             return 1
@@ -1411,12 +1567,15 @@ def main() -> int:
     ap.add_argument("--type", dest="action_type", help="动作类型")
     ap.add_argument("--text", help="表演内容")
     ap.add_argument("--intent", default="", help="内心（可选）")
+    ap.add_argument("--tag", default=None, help="你在藏什么（可选，决定被看穿时暴露什么）")
+    ap.add_argument("--script", default="ln-road-01", help="副本 ID，见 SCRIPTS")
     ap.add_argument("--realness", default="ai_fallback", help="对方是真人是机")
     args = ap.parse_args()
 
     if args.agent:
         return agent_cmd(args.agent, args.state, args.side, args.action_type,
-                         args.text, args.intent, args.realness)
+                         args.text, args.intent, args.realness, args.tag,
+                         args.script)
 
     if args.redteam:
         return redteam()
